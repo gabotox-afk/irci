@@ -1,0 +1,552 @@
+/* ================================================================
+   SNAKE para RTM32 / STX4
+   ================================================================
+   Tablero de 16x10 dibujado por la consola UART como texto ASCII,
+   redibujado cada "tick" usando secuencias ANSI para limpiar
+   pantalla (\x1b[2J\x1b[H), igual que hace una terminal cualquiera.
+
+   Controles: w=arriba, s=abajo, a=izquierda, d=derecha (no se
+   soportan flechas porque mandan secuencias de escape multi-byte
+   y complicarían mucho el parseo con un simple polling).
+
+   Input: se lee de forma NO bloqueante desde el registro de la
+   UART. La consola vive en 0xFFFFFF00 (truco "addi $r, $zero,
+   -0x100" que ya usan hola_mundo.rtm y criba.rtm para imprimir).
+   Además de poder escribirle (para sacar texto), confirmamos con
+   el debugger que también se puede LEER de ahí: en 0xFFFFFF00 se
+   ve el último byte recibido, y en 0xFFFFFF04 hay un registro de
+   estado cuyo bit 0x02 se prende cuando hay un byte esperando
+   (RX_READY). Con eso alcanza para leer teclado sin bloquear el
+   loop del juego.
+
+   No hay timer ni RNG por hardware, así que:
+   - el "delay" entre cuadros es un loop vacío contando ciclos.
+   - la comida se ubica con un generador congruencial lineal (LCG)
+     simple, sembrado con una constante fija.
+
+   Convención: cualquier valor que tenga que sobrevivir a un JAL
+   se guarda en una palabra de ".data" (new_head_x/y, eaten_flag)
+   en lugar de confiar en que un registro temporal sobreviva la
+   llamada, porque las subrutinas pisan $t0-$t3 y $a0/$a1 libremente.
+
+   Etiquetas locales: no pueden empezar con "." (el "." solo vale
+   DENTRO de un identificador), asi que cada etiqueta local lleva
+   el nombre de su funcion como prefijo (ej. "game_loop.k_up"),
+   igual que "imprimir_asciiz.bucle" en hola_mundo.rtm.
+   ================================================================ */
+
+.section ".data"
+
+border_top:    .asciiz "+----------------+\r\n"
+border_bottom: .asciiz "+----------------+\r\n"
+msg_score:     .asciiz "Puntaje: "
+msg_gameover:  .asciiz "\r\n*** GAME OVER *** Puntaje final: "
+msg_newline:   .asciiz "\r\n"
+clear_screen:  .asciiz "\x1b[2J\x1b[H"
+
+// cuerpo de la serpiente: arrays paralelos, indice 0 = cabeza
+snake_x: .pad 90
+snake_y: .pad 90
+
+// grilla de 16x10 usada solo para dibujar: 0=vacio 1=cuerpo 2=comida 3=cabeza
+grid: .pad 160
+
+snake_len:   .word 3
+dir_x:       .word 1
+dir_y:       .word 0
+food_x:      .word 0
+food_y:      .word 0
+rng_state:   .word 2463534242
+
+// scratch para pasar valores a traves de llamadas a funcion
+new_head_x:  .word 0
+new_head_y:  .word 0
+eaten_flag:  .word 0
+
+.section ".text"
+
+main:
+    addi $sp, $zero, 0xFFC
+
+    // Inicializamos la serpiente: cabeza en (8,5) moviendose a la derecha
+    addi $t0, $zero, 8
+    sb   $t0, snake_x($zero)
+    addi $t0, $zero, 5
+    sb   $t0, snake_y($zero)
+
+    addi $t1, $zero, 1
+    addi $t0, $zero, 7
+    sb   $t0, snake_x($t1)
+    addi $t0, $zero, 5
+    sb   $t0, snake_y($t1)
+
+    addi $t1, $zero, 2
+    addi $t0, $zero, 6
+    sb   $t0, snake_x($t1)
+    addi $t0, $zero, 5
+    sb   $t0, snake_y($t1)
+
+    jal place_food
+
+game_loop:
+    jal read_key                  // $6 = tecla recibida, o 0 si no hay nada
+
+    lw $t0, dir_x($zero)          // por defecto, mantenemos la direccion actual
+    lw $t1, dir_y($zero)
+
+    addi $t4, $zero, 'w'
+    beq  $6, $t4, game_loop.k_up
+    addi $t4, $zero, 's'
+    beq  $6, $t4, game_loop.k_down
+    addi $t4, $zero, 'a'
+    beq  $6, $t4, game_loop.k_left
+    addi $t4, $zero, 'd'
+    beq  $6, $t4, game_loop.k_right
+    j game_loop.k_done
+
+game_loop.k_up:
+    addi $t0, $zero, 0
+    addi $t1, $zero, -1
+    j game_loop.k_done
+game_loop.k_down:
+    addi $t0, $zero, 0
+    addi $t1, $zero, 1
+    j game_loop.k_done
+game_loop.k_left:
+    addi $t0, $zero, -1
+    addi $t1, $zero, 0
+    j game_loop.k_done
+game_loop.k_right:
+    addi $t0, $zero, 1
+    addi $t1, $zero, 0
+game_loop.k_done:
+
+    // No permitir invertir 180 grados (chocar contra el propio cuello)
+    lw  $t2, dir_x($zero)
+    lw  $t3, dir_y($zero)
+    sub $t4, $zero, $t2
+    sub $t5, $zero, $t3
+    bne $t0, $t4, game_loop.no_reverse
+    bne $t1, $t5, game_loop.no_reverse
+    addi $t0, $t2, 0
+    addi $t1, $t3, 0
+game_loop.no_reverse:
+    sw $t0, dir_x($zero)
+    sw $t1, dir_y($zero)
+
+    // Nueva posicion de cabeza = cabeza actual + direccion
+    lbu $t2, snake_x($zero)
+    lbu $t3, snake_y($zero)
+    add $t2, $t2, $t0
+    add $t3, $t3, $t1
+    sw  $t2, new_head_x($zero)
+    sw  $t3, new_head_y($zero)
+
+    // Colision con pared
+    blt  $t2, $zero, game_over
+    addi $6, $zero, 16
+    bge  $t2, $6, game_over
+    blt  $t3, $zero, game_over
+    addi $6, $zero, 10
+    bge  $t3, $6, game_over
+
+    // Colision contra el propio cuerpo (la cola libera su lugar este mismo paso)
+    addi $a0, $t2, 0
+    addi $a1, $t3, 0
+    jal point_in_snake_body
+    bne  $6, $zero, game_over
+
+    // Choca contra la comida?
+    lw   $t4, food_x($zero)
+    lw   $t5, food_y($zero)
+    lw   $t2, new_head_x($zero)
+    lw   $t3, new_head_y($zero)
+    addi $6, $zero, 0
+    bne  $t2, $t4, game_loop.no_eat
+    bne  $t3, $t5, game_loop.no_eat
+    addi $6, $zero, 1
+game_loop.no_eat:
+    sw $6, eaten_flag($zero)
+
+    beq  $6, $zero, game_loop.skip_grow
+    lw   $6, snake_len($zero)
+    addi $7, $zero, 90
+    bge  $6, $7, game_loop.skip_grow
+    addi $6, $6, 1
+    sw   $6, snake_len($zero)
+game_loop.skip_grow:
+
+    lw $6, eaten_flag($zero)
+    beq $6, $zero, game_loop.skip_food_regen
+    jal place_food
+game_loop.skip_food_regen:
+
+    // Desplazamos el cuerpo: para i = len-1 hasta 1, seg[i] = seg[i-1]
+    // (si crecio, esto duplica la cola vieja y el largo aumenta solo)
+    lw   $s0, snake_len($zero)
+    addi $s0, $s0, -1
+    addi $s1, $zero, 1
+game_loop.shift_loop:
+    blt  $s0, $s1, game_loop.shift_done
+    addi $s2, $s0, -1
+    lbu  $t0, snake_x($s2)
+    sb   $t0, snake_x($s0)
+    lbu  $t0, snake_y($s2)
+    sb   $t0, snake_y($s0)
+    addi $s0, $s0, -1
+    j game_loop.shift_loop
+game_loop.shift_done:
+
+    lw $t2, new_head_x($zero)
+    lw $t3, new_head_y($zero)
+    sb $t2, snake_x($zero)
+    sb $t3, snake_y($zero)
+
+    jal render_frame
+    jal delay
+
+    j game_loop
+
+game_over:
+    orh $a0, $zero, .hi16 msg_gameover
+    ori $a0, $a0,   .lo16 msg_gameover
+    jal print_string
+
+    lw $a0, snake_len($zero)
+    jal print_num
+
+    orh $a0, $zero, .hi16 msg_newline
+    ori $a0, $a0,   .lo16 msg_newline
+    jal print_string
+
+    // No hay HALT: usamos una excepcion no definida para que el
+    // debugger frene la ejecucion (igual que hola_mundo.rtm).
+    trap 1
+
+
+// ---------------------------------------------------------------
+// read_key: lee un byte de la UART sin bloquear.
+//   $6 = byte recibido, o 0 si no habia nada esperando.
+// ---------------------------------------------------------------
+read_key:
+    addi $t0, $zero, -0x100    // base de la UART = 0xFFFFFF00
+    lbu  $t1, 4($t0)           // registro de estado
+    ani  $t2, $t1, 2           // bit RX_READY
+    beq  $t2, $zero, read_key.rk_none
+    lbu  $6, 0($t0)            // consumimos el byte recibido
+    jr   $ra, 0
+read_key.rk_none:
+    addi $6, $zero, 0
+    jr   $ra, 0
+
+
+// ---------------------------------------------------------------
+// point_in_snake_body: $a0=x, $a1=y -> $6=1 si (x,y) esta ocupado
+// por el cuerpo (sin contar la cola, que se libera este paso).
+// ---------------------------------------------------------------
+point_in_snake_body:
+    lw   $t0, snake_len($zero)
+    addi $t0, $t0, -1           // excluimos el ultimo indice (cola)
+    addi $t1, $zero, 0
+point_in_snake_body.loop:
+    bge  $t1, $t0, point_in_snake_body.no
+    lbu  $t2, snake_x($t1)
+    lbu  $t3, snake_y($t1)
+    bne  $t2, $a0, point_in_snake_body.next
+    bne  $t3, $a1, point_in_snake_body.next
+    addi $6, $zero, 1
+    jr   $ra, 0
+point_in_snake_body.next:
+    addi $t1, $t1, 1
+    j point_in_snake_body.loop
+point_in_snake_body.no:
+    addi $6, $zero, 0
+    jr   $ra, 0
+
+
+// ---------------------------------------------------------------
+// point_in_snake_full: igual que la anterior pero revisa TODO el
+// cuerpo (incluida la cola). Se usa para no spawnear comida encima
+// de la serpiente.
+// ---------------------------------------------------------------
+point_in_snake_full:
+    lw   $t0, snake_len($zero)
+    addi $t1, $zero, 0
+point_in_snake_full.loop:
+    bge  $t1, $t0, point_in_snake_full.no
+    lbu  $t2, snake_x($t1)
+    lbu  $t3, snake_y($t1)
+    bne  $t2, $a0, point_in_snake_full.next
+    bne  $t3, $a1, point_in_snake_full.next
+    addi $6, $zero, 1
+    jr   $ra, 0
+point_in_snake_full.next:
+    addi $t1, $t1, 1
+    j point_in_snake_full.loop
+point_in_snake_full.no:
+    addi $6, $zero, 0
+    jr   $ra, 0
+
+
+// ---------------------------------------------------------------
+// rng_next: generador congruencial lineal (LCG).
+//   rng_state = rng_state * 1103515245 + 12345
+//   $6 = nuevo valor
+// ---------------------------------------------------------------
+rng_next:
+    lw   $t4, rng_state($zero)
+    orh  $t5, $zero, 0x41C6     // 1103515245 = 0x41C64E6D, partido en dos
+    ori  $t5, $t5, 0x4E6D
+    mul  $t4, $t4, $t5
+    addi $t4, $t4, 12345
+    sw   $t4, rng_state($zero)
+    addi $6, $t4, 0
+    jr   $ra, 0
+
+
+// ---------------------------------------------------------------
+// place_food: elige una celda libre al azar para la comida.
+// Reintenta hasta 30 veces si cae encima de la serpiente; si se
+// quedan sin intentos, acepta la ultima candidata igual.
+// ---------------------------------------------------------------
+place_food:
+    addi $sp, $sp, -4
+    sw $ra, 0($sp)
+
+    addi $12, $zero, 30         // intentos restantes (sobrevive los JAL de abajo)
+place_food.loop:
+    jal rng_next
+    addi $t0, $zero, 16
+    rest $a0, $6, $t0           // candidata x = rng % 16
+
+    jal rng_next
+    addi $t0, $zero, 10
+    rest $a1, $6, $t0           // candidata y = rng % 10
+
+    jal point_in_snake_full
+    beq  $6, $zero, place_food.found
+
+    addi $12, $12, -1
+    bne  $12, $zero, place_food.loop
+
+place_food.found:
+    sw $a0, food_x($zero)
+    sw $a1, food_y($zero)
+
+    lw $ra, 0($sp)
+    addi $sp, $sp, 4
+    jr $ra, 0
+
+
+// ---------------------------------------------------------------
+// print_string: $a0 = puntero a string ".asciiz", la imprime tal
+// cual (sin agregar salto de linea).
+// ---------------------------------------------------------------
+print_string:
+    addi $sp, $sp, -4
+    sw $s0, 0($sp)
+
+    addi $s0, $a0, 0
+print_string.loop:
+    lbu  $t0, 0($s0)
+    beq  $t0, $zero, print_string.done
+    addi $t1, $zero, -0x100
+    sb   $t0, 0($t1)
+    addi $s0, $s0, 1
+    j print_string.loop
+print_string.done:
+    lw $s0, 0($sp)
+    addi $sp, $sp, 4
+    jr $ra, 0
+
+
+// ---------------------------------------------------------------
+// print_num: $a0 = numero sin signo, lo imprime en decimal.
+// Misma tecnica que print32u en criba.rtm: apila los digitos y
+// los desapila para imprimirlos en el orden correcto.
+// ---------------------------------------------------------------
+print_num:
+    addi $sp, $sp, -8
+    sw $s0, 0($sp)
+    sw $s1, 4($sp)
+
+    addi $s0, $a0, 0
+    addi $s1, $zero, 0
+
+    addi $t0, $zero, 10
+    addi $t2, $zero, -0x100
+
+    bne $a0, $zero, print_num.push
+    addi $t1, $zero, '0'
+    sb $t1, 0($t2)
+    j print_num.exit
+
+print_num.push:
+    beq  $s0, $zero, print_num.pop
+    addi $s1, $s1, 1
+    restu $t1, $s0, $t0
+    sub  $s0, $s0, $t1
+    divu $s0, $s0, $t0
+    addi $t1, $t1, '0'
+    addi $sp, $sp, -1
+    sb   $t1, 0($sp)
+    j print_num.push
+
+print_num.pop:
+    beq  $s1, $zero, print_num.exit
+    lbu  $t1, 0($sp)
+    sb   $t1, 0($t2)
+    addi $s1, $s1, -1
+    addi $sp, $sp, 1
+    j print_num.pop
+
+print_num.exit:
+    lw $s0, 0($sp)
+    lw $s1, 4($sp)
+    addi $sp, $sp, 8
+    jr $ra, 0
+
+
+// ---------------------------------------------------------------
+// delay: loop vacio para espaciar los cuadros. La constante es un
+// punto de partida; ajustarla a ojo segun la velocidad deseada.
+// ---------------------------------------------------------------
+delay:
+    orh $t0, $zero, 0x0004
+    ori $t0, $t0, 0x0000
+delay.loop:
+    addi $t0, $t0, -1
+    bne  $t0, $zero, delay.loop
+    jr $ra, 0
+
+
+// ---------------------------------------------------------------
+// render_frame: limpia pantalla y redibuja todo el tablero + score.
+// ---------------------------------------------------------------
+render_frame:
+    addi $sp, $sp, -12
+    sw $ra, 0($sp)
+    sw $s0, 4($sp)
+    sw $s1, 8($sp)
+
+    orh $a0, $zero, .hi16 clear_screen
+    ori $a0, $a0,   .lo16 clear_screen
+    jal print_string
+
+    // limpiar grilla (160 celdas)
+    addi $t0, $zero, 0
+render_frame.clear:
+    addi $t1, $zero, 160
+    bge  $t0, $t1, render_frame.clear_done
+    sb   $zero, grid($t0)
+    addi $t0, $t0, 1
+    j render_frame.clear
+render_frame.clear_done:
+
+    // marcar comida: idx = food_y*16 + food_x
+    lw   $t0, food_y($zero)
+    addi $t1, $zero, 16
+    mul  $t0, $t0, $t1
+    lw   $t2, food_x($zero)
+    add  $t0, $t0, $t2
+    addi $t3, $zero, 2
+    sb   $t3, grid($t0)
+
+    // marcar cuerpo (indice 0 = cabeza, se dibuja distinto)
+    lw   $t4, snake_len($zero)
+    addi $t5, $zero, 0
+render_frame.snake_loop:
+    bge  $t5, $t4, render_frame.snake_done
+    lbu  $7, snake_x($t5)
+    lbu  $12, snake_y($t5)
+    addi $13, $zero, 16
+    mul  $13, $12, $13
+    add  $13, $13, $7
+    addi $7, $zero, 1
+    bne  $t5, $zero, render_frame.not_head
+    addi $7, $zero, 3
+render_frame.not_head:
+    sb   $7, grid($13)
+    addi $t5, $t5, 1
+    j render_frame.snake_loop
+render_frame.snake_done:
+
+    orh $a0, $zero, .hi16 border_top
+    ori $a0, $a0,   .lo16 border_top
+    jal print_string
+
+    addi $s0, $zero, 0             // fila (y)
+render_frame.row_loop:
+    addi $t0, $zero, 10
+    bge  $s0, $t0, render_frame.row_done
+
+    addi $t1, $zero, -0x100
+    addi $t2, $zero, '|'
+    sb   $t2, 0($t1)
+
+    addi $s1, $zero, 0             // columna (x)
+render_frame.col_loop:
+    addi $t0, $zero, 16
+    bge  $s1, $t0, render_frame.col_done
+
+    addi $t3, $zero, 16
+    mul  $t3, $s0, $t3
+    add  $t3, $t3, $s1
+    lbu  $t4, grid($t3)
+
+    addi $t5, $zero, 0
+    beq  $t4, $t5, render_frame.ch_empty
+    addi $t5, $zero, 1
+    beq  $t4, $t5, render_frame.ch_body
+    addi $t5, $zero, 2
+    beq  $t4, $t5, render_frame.ch_food
+    addi $7, $zero, '@'            // cabeza
+    j render_frame.ch_out
+render_frame.ch_empty:
+    addi $7, $zero, ' '
+    j render_frame.ch_out
+render_frame.ch_body:
+    addi $7, $zero, 'o'
+    j render_frame.ch_out
+render_frame.ch_food:
+    addi $7, $zero, '*'
+render_frame.ch_out:
+    addi $t1, $zero, -0x100
+    sb   $7, 0($t1)
+
+    addi $s1, $s1, 1
+    j render_frame.col_loop
+render_frame.col_done:
+
+    addi $t1, $zero, -0x100
+    addi $t2, $zero, '|'
+    sb   $t2, 0($t1)
+    addi $t2, $zero, '\r'
+    sb   $t2, 0($t1)
+    addi $t2, $zero, '\n'
+    sb   $t2, 0($t1)
+
+    addi $s0, $s0, 1
+    j render_frame.row_loop
+render_frame.row_done:
+
+    orh $a0, $zero, .hi16 border_bottom
+    ori $a0, $a0,   .lo16 border_bottom
+    jal print_string
+
+    orh $a0, $zero, .hi16 msg_score
+    ori $a0, $a0,   .lo16 msg_score
+    jal print_string
+
+    lw $a0, snake_len($zero)
+    jal print_num
+
+    orh $a0, $zero, .hi16 msg_newline
+    ori $a0, $a0,   .lo16 msg_newline
+    jal print_string
+
+    lw $ra, 0($sp)
+    lw $s0, 4($sp)
+    lw $s1, 8($sp)
+    addi $sp, $sp, 12
+    jr $ra, 0
